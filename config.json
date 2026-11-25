@@ -1,0 +1,37 @@
+{
+  "rules": [
+    "secrets",
+    "sessionCookies",
+    "ips",
+    "hosts",
+    "users",
+    "paths"
+  ],
+  "aggressive": false,
+  "sensitive_terms": [],
+  "domains": [],
+  "inventory_hostname_vars": [
+    "splunk_hostname",
+    "splunk_fqdn"
+  ],
+  "inventory_discover_domains": false,
+  "inventory_domain_vars": [
+    "ansible_domain",
+    "dns_domain",
+    "splunk_domain"
+  ],
+  "inventory_domain_exclusions": [
+    "splunk.com",
+    "amazonaws.com",
+    "microsoft.com"
+  ],
+  "include_extensions": [
+    ".log",
+    ".conf"
+  ],
+  "index_exclusions": [
+    "main",
+    "summary",
+    "history"
+  ]
+}
