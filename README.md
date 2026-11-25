@@ -1,124 +1,247 @@
-# Splunk Diag wrapper for SOC Prime LogTotal (prototype 0.8)
+# Splunk Diag Sanitizer
 
-This is not a fork or a replacement sanitization engine. Python handles tar archives and optional Ansible discovery; all sensitive-value transformations are delegated to the locally installed SOC Prime CLI. No Python packages are needed. Node.js 20+ and Python 3.10+ are required. Ansible is optional.
+A lightweight Python wrapper around [SOC Prime's LogTotal Sanitizer](https://github.com/socprime/logtotal-sanitizer) for sanitizing Splunk diagnostic bundles before sharing them with external support teams.
 
-## Install
+The tool replaces sensitive infrastructure identifiers and credentials while retaining useful troubleshooting context. It supports individual diagnostics and batches from distributed Splunk environments, with optional Ansible inventory and index name discovery.
 
-Run the installer from the project directory (Python 3.10+, Node.js 20+ and npm must already be installed):
+> **Status:** Prototype (v0.8). Wrapper tests use a mock sanitizer; compatibility with the actual upstream CLI must be validated before production use. Review all sanitized data before external release.
 
-```sh
+## Features
+
+- Process `.tar.gz` and `.tgz` diagnostic archives without manually extracting them.
+- Sanitize logs, configuration files and archive member paths.
+- Use deterministic pseudonyms to correlate matching values across diagnostic bundles.
+- Import known hostnames and DNS domains from Ansible inventories.
+- Import custom Splunk index names from `indexes.conf`, excluding common default indexes.
+- Filter out sensitive files, unsupported file types and unnecessary archive contents.
+- Process multiple diagnostics in one execution with a live progress indicator.
+- Generate individual sanitization reports and an aggregate batch report.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Splunk diagnostic archives] --> D[Python wrapper]
+    B[Ansible inventory - optional] --> D
+    C[indexes.conf - optional] --> D
+    E[Configuration and shared key] --> D
+    D --> F[Filter files and prepare sensitive terms]
+    F --> G[SOC Prime LogTotal Sanitizer]
+    G --> H[Repackage sanitized files]
+    H --> I[Sanitized diagnostic archives]
+    H --> J[Aggregate statistics]
+```
+
+| SOC Prime LogTotal Sanitizer | Splunk Diag Sanitizer wrapper |
+| --- | --- |
+| IP, hostname, user and secret detection | Splunk diagnostic archive processing |
+| Deterministic HMAC-based pseudonymization | File filtering and archive path handling |
+| Native detection rules and custom sensitive terms | Ansible inventory, DNS domain and index discovery |
+| Configurable detection categories | Batch orchestration and progress reporting |
+| Sanitization statistics | Aggregate reports without original-value mappings |
+
+The wrapper does not fork SOC Prime or implement its own anonymization engine. All sensitive-value replacement is delegated to the locally installed upstream CLI.
+
+For example, a log entry such as:
+
+```text
+ERROR TcpOutputProc - Connection to 10.20.30.15:9997 failed
+```
+
+may become:
+
+```text
+ERROR TcpOutputProc - Connection to <IP:a7f2b3c91d0246e7>:9997 failed
+```
+
+The token is illustrative. Actual replacements depend on the upstream rules and key. Identical values matched by the same rule with the same key produce consistent pseudonyms; different aliases or matching rules may produce different tokens.
+
+## Installation
+
+### Requirements
+
+- Python 3.10 or newer (no third-party Python packages required)
+- Node.js 20 or newer and npm
+- Bash for the installer
+- Ansible (optional; required only for native inventory resolution)
+
+From the repository root, run:
+
+```bash
+chmod +x install.sh
 ./install.sh
-# Or pin an approved upstream version:
+```
+
+The installer checks prerequisites, installs SOC Prime locally under `node_modules/` and creates `anonymization.key` with restrictive permissions. No sudo or global npm installation is required. If a key already exists, the installer asks before proceeding and preserves the existing key by default. Rotation requires explicit confirmation.
+
+To install an approved upstream release, replace `VERSION` with the selected version:
+
+```bash
 ./install.sh --version VERSION
 ```
 
-The installer checks prerequisites, installs SOC Prime locally in `node_modules`, checks the CLI, and creates `anonymization.key` with permissions 0600. It prompts before proceeding if the key exists, preserves it by default, and requires typing `ROTATE` before replacing it. Back up an old key securely before rotation if previous support cases require correlation. `--key-file PATH` selects a different key. Relative paths are relative to the project directory. The installer requires npm registry access or an approved configured mirror; it does not install OS runtimes or Ansible. For repeatable dependency installation retain the generated package-lock.json and use `npm ci` in an approved environment.
+Installation requires access to npm or an approved package mirror. Sanitization itself runs locally. For repeatable deployments, retain the generated `package-lock.json` and use `npm ci`.
 
-Generate the key once per support case, never per file or archive. Do not share it. Run locally on a trusted encrypted volume; the wrapper creates private temporary files containing raw content and upstream reports. Cleanup is best effort, not secure erasure. Do not use the hosted LogTotal service for this workflow.
+## Quick start
 
-```sh
-python3 sanitize_diag.py diag.tar.gz sanitized.tar.gz --cli ./node_modules/.bin/logtotal-sanitize --key-file anonymization.key --config config.json
-python3 sanitize_diag.py diag2.tar.gz sanitized2.tar.gz --cli ./node_modules/.bin/logtotal-sanitize --key-file anonymization.key --config config.json -i inventory.yml
+Generate a diagnostic on a Splunk instance:
+
+```bash
+/opt/splunk/bin/splunk diag
 ```
 
-Use the same key, exact resolved inventory, config, CLI release and rules across a support case. `--inventory-json` accepts resolved `ansible-inventory --list` output instead; treat it as sensitive, since hostvars may contain credentials. `--vault-id` can be repeated with `-i`. Dynamic inventory plugins may use the network. `--cli` can point to an approved local executable. No npm or network calls are made by the wrapper itself.
+Securely transfer the archive to the workstation or Ansible controller running the sanitizer. Run the following examples from the repository root.
 
-## Policy
-
-Default selected rules focus on infrastructure and credentials. All upstream rule IDs may be selected in config.json; for example add `paymentInfo`, `govIds`, `healthInfo`, `phoneNumbers`, `geoLocation` for broader PII detection after testing. Aggressive matching is off by default. `sensitive_terms` and inventory host identifiers are passed as additional literals via `--redact-file`; IPs use the native rule. Inventory aliases are separate strings, not canonicalized. Case variants are limited to exact/lower/upper forms. Literal substring matching and rule precedence are upstream behavior. A known hostname may receive a CUSTOM token while an unknown hostname receives a HOST token. The same value and rule/key produces the same token; changing detection context can change the rule ID and therefore the token.
-
-`domains` contains literal DNS suffixes, not wildcards. Optional `inventory_discover_domains` discovers suffixes and explicit domain variables and removes redundant automatically discovered children. Exclusions affect discovery only. The optional generated JSON custom rule uses upstream regex fragments; its loading and interaction with built-in/alwaysRedact rules must be validated against the selected release. Explicit hostname literals may take precedence over domain rules. No DNS topology or IP syntax preservation is promised. Archive path tokens are normalized into filesystem-safe names; path and content tokens may differ in punctuation.
-
-Archive filtering excludes known sensitive files, certificate/key formats, nested archives (including rotated .gz), selected database/search directories, nonregular entries, non-UTF-8/control-character files and oversized members. Limits default to 64 MiB per file, 4096 MiB total eligible text, 50000 members, and 180 seconds per CLI call. The wrapper reads each eligible member into memory; it is not end-to-end streaming. One upstream CLI process is launched per file and unique path component. Original archive stays unchanged. Output and report must not already exist. Raw tar metadata is not copied except modification time. Output report contains aggregate counts only; upstream reports are temporary and never included in the archive.
-
-## Tests and release gate
-
-`python3 -m unittest discover -s tests -v`
-
-Ten local tests passed, including archive and batch processing with a mocked CLI. Real package installation was unavailable (npm DNS/network failure); the CLI contract, especially --redact-file and --rules-file, has not been validated end to end. Before any real diagnostics are released, test with synthetic tar archives and the exact approved upstream release. Confirm no original IPs, aliases, domains, secrets or path identifiers remain; compare identical values across separate bundles; check versions/timestamps and useful file paths; verify failure does not produce an archive; review exclusions and inspect the entire sanitized result. Built-in regexes and exclusions are not exhaustive. XML/config structure can be altered by tokens; no guarantee of Splunk diag parser compatibility or irreversible anonymization. No independent residual scanner in this prototype. Zero reported matches is not assurance of safety.
-
-Upstream: https://github.com/socprime/logtotal-sanitizer
-
-## Console progress (v0.4)
-
-Interactive terminals display a single continuously rewritten progress line, with a bar, percentage, completed/total entries, sanitized and excluded counts, and current stage. Since v0.5 the total counts eligible regular files after extension and policy filtering; a candidate is complete when written or excluded for size or encoding. A preliminary streaming metadata pass counts entries, requiring a second decompression pass for compressed archives. No file contents are retained during counting. Heartbeats default to one second; redirected stderr uses plain text lines instead. A heartbeat confirms the wrapper is alive, not that the child process is making progress. The existing per-call timeout remains in effect.
+### Sanitize a single diagnostic
 
 ```bash
 python3 sanitize_diag.py original.tar.gz sanitized.tar.gz \
   --cli ./node_modules/.bin/logtotal-sanitize \
-  --key-file anonymization.key --config config.json \
-  --progress-interval 5
+  --key-file anonymization.key \
+  --config config.json
 ```
 
-Use `--quiet` to suppress progress (the final success message and errors remain). Raw filenames, sensitive values, and upstream stdout/stderr are not printed. No key regeneration or reinstall is needed when upgrading an existing installation: replace `sanitize_diag.py` and keep the existing key, configuration and installed CLI. Do not overwrite local configuration with the template.
+This creates `sanitized.tar.gz` and `sanitized.tar.gz.json`. The original archive remains unchanged.
 
-The wrapper still starts a separate upstream process per eligible file and uncached path component; progress reporting does not optimize this. Real upstream integration is still pending; tests use a mock CLI.
+### Sanitize multiple diagnostics
 
-## File scope (v0.5)
+Process every `.tar.gz` or `.tgz` archive in a directory:
 
-By default only regular `.log`, `.conf`, and uncompressed numbered `.log.N` files are sanitized and included. All other files are omitted, not copied through. Existing sensitive-file and directory exclusions take priority. Compressed rotations (`.log.gz`) remain excluded. Matching is case-insensitive. Configure `"include_extensions": [".log", ".conf", ".txt"]` to expand scope explicitly. Existing configurations without this setting inherit the new default. The report includes `excluded_extension` and `target_files`; the live denominator counts eligible file types after policy exclusions, and includes candidates subsequently skipped for size or encoding. Skip counts include all exclusions. A complete candidate count does not mean archive publication has finished. This narrower archive may omit troubleshooting information such as system command outputs, CSV/JSON files and manifests; review with Support before release. No unsupported files are copied unchanged.
+```bash
+python3 sanitize_diag.py --input-dir ./diags --output-dir ./sanitized \
+  --cli ./node_modules/.bin/logtotal-sanitize \
+  --key-file anonymization.key \
+  --config config.json
+```
 
-## Index name discovery (v0.7)
+Or select the archives explicitly:
 
-Pass `--indexes-conf PATH` once or multiple times to import index names from local Splunk configuration files. Only stanza names are read, not settings or values. Use a plain merged export (without `--debug`) from an indexer to cover all installed apps:
+```bash
+python3 sanitize_diag.py --input cm.tar.gz idx01.tar.gz sh01.tar.gz \
+  --output-dir ./sanitized-case-123 \
+  --cli ./node_modules/.bin/logtotal-sanitize \
+  --key-file anonymization.key \
+  --config config.json
+```
 
-```sh
+Directory discovery is nonrecursive and sorted by filename. Explicit inputs retain their supplied order. Batch mode loads the key and sanitization policy once and processes archives sequentially. Output names are neutral and numbered:
+
+```text
+sanitized/
+├── diag-0001.tar.gz
+├── diag-0001.tar.gz.json
+├── diag-0002.tar.gz
+├── diag-0002.tar.gz.json
+└── batch-report.json
+```
+
+Use a fresh output directory for each run: existing outputs are never overwritten. A batch stops on the first failure; completed archives remain available but must not be released without review.
+
+## Improve detection with infrastructure discovery
+
+SOC Prime detects sensitive values using its native rules. Optional discovery adds known organization-specific identifiers to its sensitive-term dictionary, helping detect short hostnames and custom index names that generic rules may miss.
+
+### Ansible inventory
+
+Add `-i inventory/production.yml` to any execution command to import inventory hostnames, connection hostnames, short names and available hostname facts. Multiple `-i` options are supported, as are repeated `--vault-id` options for inventory resolution.
+
+For a restricted environment, export the inventory on the controller:
+
+```bash
+umask 077
+ansible-inventory -i inventory/production.yml --list > inventory-export.json
+```
+
+Use `--inventory-json inventory-export.json` instead of `-i`. Treat the export as sensitive: it may contain credentials. No remote fact gathering is performed; dynamic inventory plugins may contact external services.
+
+### Splunk index names
+
+Export the effective configuration on an indexer, without `--debug`:
+
+```bash
 umask 077
 /opt/splunk/bin/splunk btool indexes list > indexes.conf
 ```
 
-Transfer the export securely to the sanitization workstation.
+Transfer the file securely to the sanitizer host and add `--indexes-conf indexes.conf` to the command. Multiple exports can be provided by repeating the option.
 
-```sh
-python3 sanitize_diag.py diag.tar.gz sanitized.tar.gz --cli ./node_modules/.bin/logtotal-sanitize --key-file anonymization.key --config config.json --indexes-conf indexes.conf
-```
+Only index stanza names are imported. The wrapper ignores `main`, `summary`, `history`, internal names starting with `_`, `[default]` and special stanzas such as `[volume:hot]`. Add generic custom index names to `index_exclusions` to avoid excessive masking.
 
-`[security_network]` and `[windows_events]` are imported; `[default]`, `[volume:hot]`, provider stanzas, internal names beginning with `_`, and invalid custom index names are ignored. Built-in non-internal indexes `main`, `summary`, and `history` are always excluded from index discovery. Duplicate names are removed. A file containing only excluded or default stanzas is valid and contributes no terms. Files without recognized stanza headers are rejected. Names are passed to the existing SOC Prime `--redact-file` dictionary, not a new encryption engine. Matching boundaries, rule precedence and replacements depend on SOC Prime; ordinary words used as index names (e.g. `main`) may cause false positives. Add additional exact index names to `index_exclusions` in config.json, for example `"index_exclusions": ["network", "windows"]`. These are additive to the built-in exclusions. This only controls index imports; manually registered terms, inventory terms and native SOC Prime rules remain independent. The same index list should be used for every diag in a case. The report includes counts only (`index_terms`, `sensitive_terms_total`); the input file is not added to the archive. The report's existing `inventory_terms` counter retains its prior meaning (manual and inventory terms before index import). Real SOC Prime integration is not verified here.
-
-## Native batch processing (v0.8)
-
-Batch mode processes separate archives sequentially in a single wrapper invocation. The key, configuration, inventory and index terms are loaded once and reused, along with the sanitized path-component cache. The original single-archive syntax remains supported. Limits apply per archive; the CLI still starts a new upstream process per file and uncached path component.
-
-### Example 1 — Single diagnostic (backward compatible)
+### Combined example
 
 ```bash
-python3 sanitize_diag.py original.tar.gz sanitized.tar.gz \
+python3 sanitize_diag.py --input-dir ./diags --output-dir ./sanitized-case-456 \
   --cli ./node_modules/.bin/logtotal-sanitize \
-  --key-file anonymization.key --config config.json \
-  --indexes-conf indexes.conf -i inventory/production.yml
+  --key-file anonymization.key \
+  --config config.json \
+  --inventory-json inventory-export.json \
+  --indexes-conf indexes.conf
 ```
 
-### Example 2 — All diagnostics in a directory
+Discovery is optional, not a prerequisite for deterministic replacements. Use the same key, upstream release, rules, inventory snapshot and index export for all diagnostics in a support case.
+
+## Configuration
+
+The supplied `config.json` defines the sanitization policy. Edit it to suit your environment.
+
+| Setting | Purpose |
+| --- | --- |
+| `rules` | Enabled upstream detection categories. Defaults to `secrets`, `sessionCookies`, `ips`, `hosts`, `users`, `paths`. |
+| `aggressive` | Enable more extensive upstream detection (default: `false`). |
+| `sensitive_terms` | Additional literal values, such as project names or service identifiers. |
+| `domains` | Known DNS suffixes; use literal domains, not wildcards. |
+| `inventory_hostname_vars` | Additional inventory variables containing hostnames. |
+| `inventory_discover_domains` | Automatically discover DNS suffixes from inventory (default: `false`). |
+| `inventory_domain_vars` | Additional variables containing DNS domains. |
+| `inventory_domain_exclusions` | Domains excluded from automatic discovery, including descendants. |
+| `include_extensions` | File extensions eligible for sanitization (default: `.log`, `.conf`). |
+| `index_exclusions` | Extra index names excluded from index discovery. |
+
+For example, these settings can be added or updated in the supplied JSON configuration:
+
+```json
+{
+  "sensitive_terms": ["INTERNAL_PROJECT_NAME"],
+  "domains": ["internal.example.com"],
+  "inventory_discover_domains": true,
+  "inventory_domain_exclusions": ["splunk.com", "microsoft.com", "amazonaws.com"],
+  "include_extensions": [".log", ".conf"],
+  "index_exclusions": ["network", "windows"]
+}
+```
+
+A configured domain also targets descendant subdomains. Automatic discovery avoids redundant discovered suffixes when a parent already covers them. Discovery exclusions are not global allowlists. Custom terms, domain rules and native rules may overlap; upstream matching precedence determines the actual replacement.
+
+### File filtering
+
+By default, the wrapper includes `.log`, `.conf` and uncompressed numbered log rotations such as `splunkd.log.1`. Other files are omitted, not copied unchanged.
+
+Security exclusions take precedence, including known credential files (`splunk.secret`, `passwd`, `passwords.conf`, `authentication.conf`, `user-seed.conf`), certificate/key formats, selected database and dispatch directories, links, nested archives and unsupported binary or encoded files. This means compressed log rotations are not included.
+
+You can explicitly extend `include_extensions` with types such as `.txt` or `.csv` when needed. The resulting archive is a reduced diagnostic, not necessarily a drop-in replacement for a complete Splunk diag.
+
+## Progress and reports
+
+An interactive terminal displays an in-place progress line showing the current diagnostic, completed diagnostics, eligible file count, percentage and exclusions. For example:
+
+```text
+[272.0s] Diag 3/5 | Done 2/5 | [#############-------] 67.2% 168/250 target files | OK 168 Skip 42
+```
+
+Use `--progress-interval 5` to update every five seconds or `--quiet` to suppress progress. Redirected output uses plain-text status messages. Reports contain aggregate rule counts, file exclusions and discovery statistics rather than original-to-token mappings. Inspect them to identify omissions and processing failures.
+
+For the full CLI reference, run:
 
 ```bash
-python3 sanitize_diag.py --input-dir ./diags/ --output-dir ./sanitized/ \
-  --cli ./node_modules/.bin/logtotal-sanitize \
-  --key-file anonymization.key --config config.json \
-  --indexes-conf indexes.conf -i inventory/production.yml
+python3 sanitize_diag.py --help
 ```
 
-The directory scan is nonrecursive and selects `.tar.gz` and `.tgz` files in sorted filename order. Use a dedicated input directory containing only the intended diagnostics.
+## Ansible automation
 
-### Example 3 — Explicit selection and exported inventory
-
-```bash
-python3 sanitize_diag.py --input cm.tar.gz idx01.tar.gz sh01.tar.gz \
-  --output-dir ./sanitized-case-123/ \
-  --cli ./node_modules/.bin/logtotal-sanitize \
-  --key-file anonymization.key --config config.json \
-  --indexes-conf indexes.conf --inventory-json inventory-export.json
-```
-
-The output directory is created if needed. Output names are numbered in input order (`diag-0001.tar.gz`, `diag-0002.tar.gz`, etc.), not derived from sensitive original names. Each archive has its own `.tar.gz.json` report; `batch-report.json` contains aggregate counts and completion status. Keep the input order internally if a mapping to original components is needed. Existing outputs are never overwritten. Use a new directory for each run. Duplicate input paths and identical input/output directories in directory mode are rejected. The live progress line shows the archive number, completed archives and current archive's candidate-file count.
-
-A batch stops on the first failure with a nonzero exit status. Previously completed archives remain, and a batch report marks a processing failure when possible. The batch is not transactional; do not release partial outputs without review. Setup failures may occur before a batch report exists.
-
-### Example 4 — Ansible controller batch task
-
-After collecting all diagnostics into a dedicated controller directory, run this in the collection play **after all transfers have completed**, without `serial` on that play (or use a separate controller play). All paths in this example must already be defined in your playbook variables; the inventory export and index export must exist on the controller.
+Generate diagnostics on the Splunk hosts, transfer them using `ansible.builtin.fetch` into a private, dedicated directory on the controller, and invoke batch mode once all transfers finish. For example, with the paths defined in your playbook variables:
 
 ```yaml
-- name: Sanitize collected diagnostics in one batch
+- name: Sanitize all collected diagnostics
   ansible.builtin.command:
     argv:
       - python3
@@ -130,17 +253,37 @@ After collecting all diagnostics into a dedicated controller directory, run this
       - --cli
       - "{{ diag_anonymizer_home }}/node_modules/.bin/logtotal-sanitize"
       - --key-file
-      - "{{ diag_anonymizer_key }}"
+      - "{{ diag_anonymizer_home }}/anonymization.key"
       - --config
-      - "{{ diag_anonymizer_config }}"
-      - --indexes-conf
-      - "{{ diag_indexes_conf }}"
+      - "{{ diag_anonymizer_home }}/config.json"
       - --inventory-json
       - "{{ diag_inventory_export }}"
+      - --indexes-conf
+      - "{{ diag_indexes_conf }}"
   delegate_to: localhost
   become: false
   run_once: true
   no_log: true
 ```
 
-Use the default linear strategy so the batch task starts only after transfers finish. With `serial`, `run_once` executes once per serial batch, not once for the entire play; use a distinct controller phase instead. Ansible captures command output, so the interactive live bar is not normally visible during this task. A separate controller play must also be included in any `--limit` selection. Keep input and output directories private, and review the reports and sanitized files before release.
+Run this task after collection with the linear strategy and no `serial`, or in a separate controller play. With `serial`, `run_once` runs per batch. If using `--limit`, ensure a separate controller play is not excluded. Ansible captures command output rather than displaying the interactive progress bar live.
+
+## Security and limitations
+
+- Keep the key, original archives, inventory exports and index exports private. Never commit or distribute them. Reuse a key within a support case; rotate it between unrelated cases as appropriate.
+- Use a trusted encrypted workstation and private output directories. Temporary files may contain raw log data and upstream replacement reports; cleanup is not secure erasure.
+- Pseudonymization does not guarantee irreversible anonymization. Tokens may change with matching context, and replacements may alter IP, DNS or configuration syntax.
+- Default resource limits are 64 MiB per file, 4096 MiB of eligible text per archive, 50,000 archive members and 180 seconds per upstream invocation. See `--help` for overrides. A new upstream process is launched for each eligible file and uncached path component.
+- No independent residual-data scanner is implemented. Detection rules and exclusions are not exhaustive. Review sanitized content, filenames and reports before sharing; zero reported matches does not establish safety.
+
+## Testing
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The wrapper's ten local tests cover archive processing, filtering, discovery, progress and batch behavior with a mock CLI. Actual upstream installation and end-to-end integration were not verified in the development environment. Validate the selected SOC Prime release using synthetic diagnostics, including custom terms, domain rules, cross-bundle consistency and failure handling, before processing real data for release.
+
+## Acknowledgments
+
+The sanitization engine is provided by [SOC Prime LogTotal Sanitizer](https://github.com/socprime/logtotal-sanitizer). This project is an independent Splunk-specific orchestration wrapper, not an official SOC Prime or Splunk product.
