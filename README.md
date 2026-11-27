@@ -4,7 +4,7 @@ A lightweight Python wrapper around [SOC Prime's LogTotal Sanitizer](https://git
 
 The tool replaces sensitive infrastructure identifiers and credentials while retaining useful troubleshooting context. It supports individual diagnostics and batches from distributed Splunk environments, with optional Ansible inventory and index name discovery.
 
-> **Status:** Prototype (v0.8). Wrapper tests use a mock sanitizer; compatibility with the actual upstream CLI must be validated before production use. Review all sanitized data before external release.
+> **Status:** Prototype (v0.10). Wrapper tests use a mock sanitizer; compatibility with the actual upstream CLI must be validated before production use. Review all sanitized data before external release.
 
 ## Features
 
@@ -73,6 +73,18 @@ chmod +x install.sh
 ```
 
 The installer checks prerequisites, installs SOC Prime locally under `node_modules/` and creates `anonymization.key` with restrictive permissions. No sudo or global npm installation is required. If a key already exists, the installer asks before proceeding and preserves the existing key by default. Rotation requires explicit confirmation.
+
+### Offline installation
+
+On an approved Internet-connected machine, download the published package using `npm pack @socprime/logtotal-sanitizer@VERSION`. Verify its provenance and transfer the resulting `socprime-logtotal-sanitizer-VERSION.tgz` into this project's root directory (alongside `install.sh`). The tarball can also be supplied through your internal repository. It is not bundled with this distribution.
+
+```bash
+./install.sh --offline
+# Select a particular bundled release when multiple tarballs are present:
+./install.sh --offline --version VERSION
+```
+
+Offline mode installs from the local tarball with npm's `--offline`, `--no-audit`, `--no-fund` and `--ignore-scripts` options. Missing or ambiguous packages cause an error; there is no registry fallback. Existing key confirmation and preservation still apply. If the package has dependencies not available locally, installation fails. On RHEL with a parallel Python installation, use `PYTHON_BIN=python3.13 ./install.sh --offline` (or Python 3.12). Node.js and npm must already be installed.
 
 To install an approved upstream release, replace `VERSION` with the selected version:
 
@@ -222,13 +234,56 @@ You can explicitly extend `include_extensions` with types such as `.txt` or `.cs
 
 ## Progress and reports
 
+Each per-archive JSON report includes a `processed_files` list for successfully written members. The batch report includes the same list within each `archives` entry. For example:
+
+```json
+{
+  "processed_files": [
+    {
+      "path": "diag/log/splunkd.log",
+      "input_size_bytes": 52428800,
+      "output_size_bytes": 53120000,
+      "elapsed_seconds": 192.417,
+      "status": "completed"
+    }
+  ]
+}
+```
+
+Paths are the sanitized archive member names, not original paths. Sizes are in bytes (before and after sanitization). Elapsed time is wall-clock seconds covering member-path sanitization, content processing and writing the member, excluding initial archive traversal and reading. Cached path components may reduce later timings. Timed-out files are not listed as completed; their original paths and timing remain in the separate internal-only timeout report. Review all reports before sharing, since path sanitization is best effort.
+
+
 An interactive terminal displays an in-place progress line showing the current diagnostic, completed diagnostics, eligible file count, percentage and exclusions. For example:
 
 ```text
-[272.0s] Diag 3/5 | Done 2/5 | [#############-------] 67.2% 168/250 target files | OK 168 Skip 42
+[272.0s] Diag 3/5 | Done 2/5 | [#############-------] 67.2% 168/250 target files | OK 166 Timeout 2 Skip 42
 ```
 
 Use `--progress-interval 5` to update every five seconds or `--quiet` to suppress progress. Redirected output uses plain-text status messages. Reports contain aggregate rule counts, file exclusions and discovery statistics rather than original-to-token mappings. Inspect them to identify omissions and processing failures.
+
+### Timeout handling
+
+Each SOC Prime invocation has a default timeout of **1,800 seconds (30 minutes)**. This is not a limit on the entire diagnostic or batch. Override it with `--timeout SECONDS`, or disable the sanitizer timeout with `--timeout 0` (inventory resolution still has its own timeout).
+
+```bash
+python3 sanitize_diag.py --input-dir ./diags --output-dir ./sanitized \
+    --cli ./node_modules/.bin/logtotal-sanitize \
+    --key-file anonymization.key --config config.json --timeout 1800
+```
+
+```bash
+python3 sanitize_diag.py --input-dir ./diags --output-dir ./sanitized-unlimited \
+    --cli ./node_modules/.bin/logtotal-sanitize \
+    --key-file anonymization.key --config config.json --timeout 0
+```
+
+If a file's content or archive path times out, the subprocess is terminated, partial output is discarded and the entire member is omitted. Processing continues with the next file. The progress line distinguishes successful files (`OK`), timeout exclusions (`Timeout`) and other exclusions (`Skip`). Other sanitizer errors still abort processing. If no files can be included, the archive is not published and the command fails.
+
+The ordinary JSON report records `files.excluded_timeout` and `status: completed_with_timeouts` when applicable; the batch report also counts timeout exclusions. A partially successful run exits zero, so automation must inspect the reports if timeout omissions are unacceptable. An archive with no included files exits nonzero.
+
+For each affected diagnostic, a separate `*.tar.gz.timeouts.private.json` report contains the exact original member paths, byte sizes, timeout stage, configured timeout and elapsed file processing time. **This report contains sensitive original paths and is for internal use only; never send it to Support.** It is written with mode `0600` and updated as timeouts occur, including if a later error prevents archive publication. The normal report does not include these original paths.
+
+Disabling timeouts can cause an indefinitely stuck sanitizer to block the batch. Ansible or other external job timeouts are independent of this option. Always review the output and omissions before external release.
 
 For the full CLI reference, run:
 
@@ -282,7 +337,7 @@ Run this task after collection with the linear strategy and no `serial`, or in a
 python3 -m unittest discover -s tests -v
 ```
 
-The wrapper's ten local tests cover archive processing, filtering, discovery, progress and batch behavior with a mock CLI. Actual upstream installation and end-to-end integration were not verified in the development environment. Validate the selected SOC Prime release using synthetic diagnostics, including custom terms, domain rules, cross-bundle consistency and failure handling, before processing real data for release.
+The wrapper's local tests cover archive processing, filtering, discovery, progress and batch behavior with a mock CLI. Actual upstream installation and end-to-end integration were not verified in the development environment. Validate the selected SOC Prime release using synthetic diagnostics, including custom terms, domain rules, cross-bundle consistency and failure handling, before processing real data for release.
 
 ## Acknowledgments
 

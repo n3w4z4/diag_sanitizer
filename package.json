@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@socprime/logtotal-sanitizer": "file:socprime-logtotal-sanitizer-0.2.1-beta.0.tgz"
+  }
+}

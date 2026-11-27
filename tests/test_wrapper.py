@@ -70,7 +70,7 @@ class Tests(unittest.TestCase):
             with patch.object(sys,'argv',['x',str(src),str(out),'--key-file',str(key),'--cli',str(cli),'--indexes-conf',str(indexes)]): s.main()
             with tarfile.open(out) as t:
                 self.assertEqual(t.getnames(),['diag/IP-1234567890abcdef.log']); self.assertEqual(t.extractfile(t.getmembers()[0]).read(),b'peer=<IP:1234567890abcdef>')
-            rep=json.loads(Path(str(out)+'.json').read_text());self.assertEqual(rep['files']['excluded_policy'],2);self.assertNotIn('private',json.dumps(rep)); self.assertEqual(rep['files']['excluded_extension'],2); self.assertEqual(rep['files']['target_files'],1); self.assertEqual(rep['index_terms'],1); self.assertNotIn('security_network',json.dumps(rep))
+            rep=json.loads(Path(str(out)+'.json').read_text());self.assertEqual(rep['files']['excluded_policy'],2);self.assertNotIn('private',json.dumps(rep)); self.assertEqual(rep['files']['excluded_extension'],2); self.assertEqual(rep['files']['target_files'],1); self.assertEqual(rep['index_terms'],1); self.assertEqual(len(rep['processed_files']),1); self.assertEqual(rep['processed_files'][0]['path'],'diag/IP-1234567890abcdef.log'); self.assertEqual(rep['processed_files'][0]['input_size_bytes'],len(b'peer=10.1.2.3')); self.assertEqual(rep['processed_files'][0]['output_size_bytes'],len(b'peer=<IP:1234567890abcdef>')); self.assertGreaterEqual(rep['processed_files'][0]['elapsed_seconds'],0); self.assertNotIn('security_network',json.dumps(rep))
     def test_batch(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d); key=p/'key'; key.write_text('a'*64)
@@ -85,9 +85,41 @@ class Tests(unittest.TestCase):
             for i in (1,2):
                 with tarfile.open(out/f'diag-{i:04d}.tar.gz') as t:
                     self.assertEqual(t.extractfile('diag/splunkd.log').read(),b'TOKEN')
-            report=json.loads((out/'batch-report.json').read_text()); self.assertEqual(report['archives_completed'],2); self.assertEqual(report['files']['included'],2); self.assertNotIn('secret-',json.dumps(report))
+            report=json.loads((out/'batch-report.json').read_text()); self.assertEqual(report['archives_completed'],2); self.assertEqual(len(report['archives'][0]['processed_files']),1); self.assertEqual(report['files']['included'],2); self.assertNotIn('secret-',json.dumps(report))
             with patch.object(sys,'argv',argv), self.assertRaises(SystemExit): s.main()
             bad=p/'bad.tar.gz'; bad.write_bytes(b'invalid'); out2=p/'partial'
             with patch.object(sys,'argv',['x','--input',str(inp/'secret-a.tar.gz'),str(bad),'--output-dir',str(out2),'--key-file',str(key),'--cli',str(cli),'--quiet']), self.assertRaises(SystemExit): s.main()
             report=json.loads((out2/'batch-report.json').read_text()); self.assertEqual(report['status'],'failed'); self.assertEqual(report['archives_completed'],1); self.assertFalse((out2/'diag-0002.tar.gz').exists())
+    def test_timeout_policies(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d); key=p/'key'; key.write_text('a'*64)
+            cli=p/'cli'; cli.write_text('#!/bin/sh\nexit 0\n'); cli.chmod(0o700)
+            src=p/'in.tar.gz'
+            def make_archive(entries):
+                with tarfile.open(src,'w:gz') as t:
+                    for name,data in entries:
+                        m=tarfile.TarInfo(name); m.size=len(data); t.addfile(m,io.BytesIO(data))
+            make_archive([('diag/slow.log',b'SLOW'),('diag/pathslow.log',b'content'),('diag/ok.conf',b'OK')])
+            def fake(cmd, **kw):
+                raw=Path(cmd[cmd.index('-o')-1]); clean=Path(cmd[cmd.index('-o')+1]); rep=Path(cmd[cmd.index('--report')+1]); data=raw.read_bytes()
+                if data in (b'SLOW',b'pathslow.log') and kw['timeout'] is not None:
+                    clean.write_bytes(b'partial sensitive output'); rep.write_text('partial')
+                    raise subprocess.TimeoutExpired(cmd,kw['timeout'])
+                clean.write_bytes(data); rep.write_text(json.dumps({'counts':{}}))
+                return subprocess.CompletedProcess(cmd,0)
+            def execute(out, *extra):
+                with patch.object(sys,'argv',['x',str(src),str(out),'--key-file',str(key),'--cli',str(cli),'--quiet',*extra]), patch.object(s.subprocess,'run',side_effect=fake) as call:
+                    s.main()
+                    return call
+            out=p/'out.tar.gz'; call=execute(out)
+            self.assertTrue(all(c.kwargs['timeout']==1800 for c in call.call_args_list))
+            with tarfile.open(out) as t: self.assertEqual(t.getnames(),['diag/ok.conf'])
+            report=json.loads(Path(str(out)+'.json').read_text()); self.assertEqual(report['status'],'completed_with_timeouts'); self.assertEqual(report['files']['excluded_timeout'],2); self.assertEqual([f['path'] for f in report['processed_files']],['diag/ok.conf']); self.assertNotIn('slow.log',json.dumps(report))
+            private=Path(str(out)+'.timeouts.private.json'); details=json.loads(private.read_text()); self.assertEqual([x['stage'] for x in details['files']],['file_content','archive_path']); self.assertEqual([x['original_path'] for x in details['files']],['diag/slow.log','diag/pathslow.log']); self.assertEqual(private.stat().st_mode & 0o777,0o600)
+            out2=p/'unlimited.tar.gz'; call=execute(out2,'--timeout','0'); self.assertTrue(all(c.kwargs['timeout'] is None for c in call.call_args_list)); self.assertFalse(Path(str(out2)+'.timeouts.private.json').exists())
+            with tarfile.open(out2) as t: self.assertEqual(len(t.getnames()),3)
+            make_archive([('diag/slow.log',b'SLOW')]); out3=p/'empty.tar.gz'
+            with self.assertRaises(SystemExit): execute(out3,'--timeout','1')
+            self.assertFalse(out3.exists()); self.assertTrue(Path(str(out3)+'.timeouts.private.json').exists()); self.assertEqual(json.loads(Path(str(out3)+'.json').read_text())['status'],'failed_no_files_included')
 if __name__=='__main__': unittest.main()

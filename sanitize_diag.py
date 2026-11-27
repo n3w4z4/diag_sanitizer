@@ -165,7 +165,7 @@ def process(args, progress):
             for number, (src, out) in enumerate(jobs, 1):
                 prefix = f'Diag {number}/{len(jobs)} | Done {number-1}/{len(jobs)} | ' if batch else ''
                 summary = process_archive(args, progress, src, out, policy, prefix)
-                summaries.append({'archive': out.name, 'report': out.name + '.json', 'status': 'completed'})
+                summaries.append({'archive': out.name, 'report': out.name + '.json', 'status': summary.get('status', 'completed'), 'excluded_timeout': summary['files'].get('excluded_timeout', 0), 'processed_files': summary['processed_files']})
                 files.update(summary['files'])
                 matches.update(summary['matches_by_rule'])
         except BaseException:
@@ -173,9 +173,9 @@ def process(args, progress):
                 write_batch_report(batch_report, jobs, summaries, files, matches, policy, 'failed')
             raise
         if batch:
-            write_batch_report(batch_report, jobs, summaries, files, matches, policy, 'completed')
-            progress.emit(f'Diags {len(jobs)}/{len(jobs)} | Finished successfully')
-    print('Sanitized archive(s) and aggregate report(s) created; manual review required.', flush=True)
+            write_batch_report(batch_report, jobs, summaries, files, matches, policy, 'completed_with_timeouts' if files['excluded_timeout'] else 'completed')
+            progress.emit(f'Diags {len(jobs)}/{len(jobs)} | Finished; timeouts: {files["excluded_timeout"]}')
+    print(f'Sanitized archive(s) and aggregate report(s) created; timeout exclusions: {files["excluded_timeout"]}. Manual review required.', flush=True)
 
 
 def plan_jobs(args):
@@ -203,7 +203,7 @@ def plan_jobs(args):
     protected = set(sources) | {Path(args.key_file).resolve()}
     for value in [getattr(args,'config',None),getattr(args,'inventory_json',None),*getattr(args,'indexes_conf',[]),*getattr(args,'inventory',[])]:
         if value: protected.add(Path(value).resolve())
-    outputs = [p for _,out in jobs for p in (out,Path(str(out)+'.json'))]
+    outputs = [p for _,out in jobs for p in (out,Path(str(out)+'.json'),Path(str(out)+'.timeouts.private.json'))]
     if batch_report: outputs.append(batch_report)
     if len({p.resolve() for p in outputs}) != len(outputs) or any(p.exists() or p.is_symlink() or p.resolve() in protected for p in outputs):
         raise ValueError('Outputs must be new and distinct')
@@ -218,6 +218,11 @@ def write_batch_report(path, jobs, summaries, files, matches, policy, status):
     if status == 'failed':
         report['failed_archive_number'] = len(summaries)+1
         report['archives_not_completed'] = len(jobs)-len(summaries)
+        failed_out = jobs[len(summaries)][1]
+        failed_private = Path(str(failed_out)+'.timeouts.private.json')
+        if failed_private.is_file():
+            report['failed_archive_timeout_report'] = failed_private.name
+            report['failed_archive_timeout_count'] = len(json.loads(failed_private.read_text())['files'])
     with path.open('x') as f: json.dump(report,f,indent=2)
 
 
@@ -268,6 +273,12 @@ def process_archive(args, progress, src, out, policy, prefix=''):
     report=Path(str(out)+'.json')
     extensions=policy['extensions']; base=policy['base']
     stats=collections.Counter(); counts=collections.Counter(); names=set()
+    stats['excluded_timeout'] = 0
+    timeouts = []
+    processed_files = []
+    private_report = Path(str(out)+'.timeouts.private.json')
+    timeout = args.timeout or None
+    timeout_label = f'{timeout}s' if timeout else 'disabled'
     calls = 0
     total = 0
     candidates = 0
@@ -289,17 +300,17 @@ def process_archive(args, progress, src, out, policy, prefix=''):
         filled = min(20, int(pct / 5))
         bar = '#' * filled + '-' * (20 - filled)
         return (prefix+f'[{bar}] {pct:5.1f}% {completed_candidates:,}/{candidates:,} target files | '
-                f'OK {stats["included"]:,} Skip {skipped:,} | {activity}')
+                f'OK {stats["included"]:,} Timeout {stats["excluded_timeout"]:,} Skip {skipped-stats["excluded_timeout"]:,} | {activity}')
     with tempfile.TemporaryDirectory(prefix='.diag-',dir=out.parent) as td:
         tmp=Path(td); archive=tmp/'result.tar.gz'; raw=tmp/'input'; clean=tmp/'output'; rep=tmp/'report.json'
         def sanitize(data, aggregate=False):
             nonlocal calls
             calls += 1
             kind = 'Sanitizing file content' if aggregate else 'Sanitizing archive path component'
-            progress.update(status(f'{kind} ({len(data):,} bytes; timeout {args.timeout}s)'))
+            progress.update(status(f'{kind} ({len(data):,} bytes; timeout {timeout_label})'))
             raw.write_bytes(data)
             clean.unlink(missing_ok=True); rep.unlink(missing_ok=True)
-            r=subprocess.run(base+[str(raw),'-o',str(clean),'--report',str(rep),'--report-format','json'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=args.timeout)
+            r=subprocess.run(base+[str(raw),'-o',str(clean),'--report',str(rep),'--report-format','json'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=timeout)
             if r.returncode or not clean.is_file() or not rep.is_file():
                 progress.emit(f'Sanitizer failed during {kind.lower()} (exit code {r.returncode})')
                 raise ValueError('SOC Prime processing failed; no archive released')
@@ -335,13 +346,43 @@ def process_archive(args, progress, src, out, policy, prefix=''):
                 if any(ord(c)<32 and c not in '\t\n\r\f' for c in text): stats['excluded_binary_or_encoding']+=1; completed_candidates+=1; progress.update(status('Skipping excluded entry')); continue
                 stats['input_bytes']+=len(data)
                 if stats['input_bytes']>args.max_total_mib*1024**2: raise ValueError('Archive text size limit exceeded')
-                newname=path_name(m.name)
-                if newname in names: raise ValueError('Sanitized archive path collision')
+                stage = 'archive_path'
+                started = time.monotonic()
+                try:
+                    newname=path_name(m.name)
+                    if newname in names: raise ValueError('Sanitized archive path collision')
+                    stage = 'file_content'
+                    result=sanitize(data,True)
+                except subprocess.TimeoutExpired:
+                    # subprocess.run kills and waits for the child before raising.
+                    # Discard every partial output, never copy the original member.
+                    for temporary in (raw, clean, rep):
+                        temporary.unlink(missing_ok=True)
+                    stats['excluded_timeout'] += 1
+                    completed_candidates += 1
+                    timeouts.append({'original_path': m.name, 'size_bytes': m.size,
+                                     'stage': stage, 'timeout_seconds': args.timeout,
+                                     'file_elapsed_seconds': round(time.monotonic()-started, 2),
+                                     'status': 'excluded_timeout'})
+                    # Persist immediately, even if a later non-timeout error aborts.
+                    # This report is INTERNAL ONLY and contains sensitive original paths.
+                    temp_report = tmp/'timeouts.json'
+                    temp_report.write_text(json.dumps({'internal_only': True, 'files': timeouts}, indent=2))
+                    if len(timeouts) == 1:
+                        os.link(temp_report, private_report)
+                        temp_report.unlink()
+                    else:
+                        os.replace(temp_report, private_report)
+                    progress.update(status('File timed out; omitted'), True)
+                    continue
                 names.add(newname)
-                result=sanitize(data,True)
                 entry=tarfile.TarInfo(newname); entry.size=len(result); entry.mode=0o600; entry.mtime=m.mtime
                 progress.update(status('Writing sanitized file'))
                 dest.addfile(entry,io.BytesIO(result)); stats['included']+=1; completed_candidates+=1
+                processed_files.append({'path': newname, 'input_size_bytes': m.size,
+                                        'output_size_bytes': len(result),
+                                        'elapsed_seconds': round(time.monotonic()-started, 3),
+                                        'status': 'completed'})
                 progress.update(status('File completed'))
                 if not progress.tty and (stats['included'] == 1 or stats['included'] % 25 == 0):
                     progress.emit(status('Progress'))
@@ -349,17 +390,22 @@ def process_archive(args, progress, src, out, policy, prefix=''):
         if stats['included'] + sum(v for k,v in stats.items() if k.startswith('excluded_')) != total: raise ValueError('Archive changed between passes')
         if completed_candidates != candidates: raise ValueError('Candidate count changed between passes')
         stats['target_files']=candidates
-        if not stats['included']: raise ValueError('No files included')
-        summary={'files':dict(stats),'matches_by_rule':dict(counts),'review_required':True,**policy['metadata']}
+        summary={'status': 'completed_with_timeouts' if timeouts else 'completed', 'files':dict(stats),'processed_files':processed_files,'matches_by_rule':dict(counts),'review_required':True,**policy['metadata']}
+        if timeouts:
+            summary['internal_timeout_report'] = private_report.name
+        if not stats['included']:
+            summary['status'] = 'failed_no_files_included'
+            with report.open('x') as f: json.dump(summary,f,indent=2)
+            raise ValueError('No files included')
         # Do not overwrite existing destinations; remove report if archive publication fails.
         with report.open('x') as f: json.dump(summary,f,indent=2)
         try: os.link(archive,out)
         except BaseException: report.unlink(missing_ok=True); raise
-    progress.emit(status('Finished successfully'))
+    progress.emit(status('Finished with timeout exclusions' if timeouts else 'Finished successfully'))
     return summary
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__); p.add_argument('input',nargs='?'); p.add_argument('output',nargs='?'); p.add_argument('--key-file',required=True); p.add_argument('--config'); p.add_argument('--cli',default='logtotal-sanitize'); p.add_argument('-i','--inventory',action='append',default=[]); p.add_argument('--inventory-json'); p.add_argument('--vault-id',action='append',default=[]); p.add_argument('--max-mib',type=int,default=64); p.add_argument('--max-total-mib',type=int,default=4096); p.add_argument('--max-members',type=int,default=50000); p.add_argument('--timeout',type=int,default=180)
+    p=argparse.ArgumentParser(description=__doc__); p.add_argument('input',nargs='?'); p.add_argument('output',nargs='?'); p.add_argument('--key-file',required=True); p.add_argument('--config'); p.add_argument('--cli',default='logtotal-sanitize'); p.add_argument('-i','--inventory',action='append',default=[]); p.add_argument('--inventory-json'); p.add_argument('--vault-id',action='append',default=[]); p.add_argument('--max-mib',type=int,default=64); p.add_argument('--max-total-mib',type=int,default=4096); p.add_argument('--max-members',type=int,default=50000); p.add_argument('--timeout',type=int,default=1800,help='Seconds per SOC Prime invocation (default: 1800; 0 disables)')
     p.add_argument('--indexes-conf', action='append', default=[], metavar='PATH', help='Import index names from indexes.conf or plain btool indexes list output; repeatable')
     p.add_argument('--progress-interval', type=float, default=1, help='Seconds between heartbeat updates (default: 1)'); p.add_argument('--quiet', action='store_true', help='Suppress progress messages on stderr')
     batch=p.add_mutually_exclusive_group()
@@ -371,6 +417,7 @@ def main():
         if a.input or a.output or not a.output_dir: p.error('Batch mode requires --output-dir and no positional arguments')
     elif not a.input or not a.output or a.output_dir: p.error('Provide INPUT OUTPUT or use batch mode')
     if not 0 < a.progress_interval < float('inf'): p.error('--progress-interval must be positive and finite')
+    if a.timeout < 0: p.error('--timeout must be nonnegative')
     if a.inventory and a.inventory_json: p.error('Use inventory or inventory JSON, not both')
     try: run(a)
     except subprocess.TimeoutExpired: p.exit(1,'A subprocess exceeded its timeout; current archive not published; earlier completed batch outputs may remain.\n')
